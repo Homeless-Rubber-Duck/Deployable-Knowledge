@@ -1,0 +1,3 @@
+[submodule "core/Bonsai-demo"]
+	path = core/Bonsai-demo
+	url = https://github.com/PrismML-Eng/Bonsai-demo.git
