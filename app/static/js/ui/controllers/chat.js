@@ -86,18 +86,24 @@ export function initChatController() {
         },
         {
           signal: aborter.signal,
+          onMeta(meta) {
+            console.log("Chat meta:", meta);
+            renderChatCitations(bubble.citeEl, meta.context, { maxItems: 8 });
+            showContext(data.sources, text);
+          },
           onDelta(delta) {
+            console.log("Chat delta:", delta);
             buf += delta;
             bubble.clearPending();
             bubble.mdEl.innerHTML = md(buf);
             log.scrollTop = log.scrollHeight;
           },
           onDone(data) {
+            console.log("Chat done:", data);
             bubble.clearPending();
             if (!buf) bubble.mdEl.innerHTML = md("(no response)");
             if (data?.sources) {
               showContext(data.sources, text);
-              renderChatCitations(bubble.citeEl, data.sources, { maxItems: 8 });
             }
           },
           onError(data) {
@@ -121,7 +127,6 @@ export function initChatController() {
           persona: Store.persona,
           template_id: getSelectedPromptTemplateId(),
         });
-        bubble.clearPending();
         bubble.mdEl.innerHTML = md(res.response ?? "(no response)");
         if (res.context) {
           showContext(res.context, text);

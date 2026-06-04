@@ -54,6 +54,10 @@ def chat_stream(req: ChatRequest) -> Iterator[ChatChunk]:
         top_k=req.top_k,
         exclude_sources=set(req.inactive_sources or []),
     )
+
+    meta = json.dumps({"top_k": req.top_k, "template": req.template_id, "context": context})
+    yield ChatChunk(type="meta", text=meta)
+
     prompt = renderer.build_prompt(
         summary="",
         history=[],
@@ -62,8 +66,7 @@ def chat_stream(req: ChatRequest) -> Iterator[ChatChunk]:
         persona=req.persona,
         template_id=req.template_id,
     )
-    meta = json.dumps({"top_k": req.top_k, "template": req.template_id})
-    yield ChatChunk(type="meta", text=meta)
+    
     for token in renderer.stream_llm(prompt, user_id=req.user_id, template_id=req.template_id):
         yield ChatChunk(type="delta", text=token)
     yield ChatChunk(type="done", sources=_to_sources(context), usage={})
