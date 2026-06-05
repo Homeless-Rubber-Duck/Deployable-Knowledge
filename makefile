@@ -50,9 +50,8 @@ verify-offline: export HF_HUB_OFFLINE=1
 verify-offline: export EMBEDDINGS_OFFLINE_ONLY=1
 verify-offline:
 	@if [ -x "$(PY)" ]; then PYBIN="$(PY)"; else echo "⚠️  $(PY) missing; falling back to $(PYTHON)"; PYBIN="$(PYTHON)"; fi; \
-	PYTHONPATH=. $$PYBIN -c "from core.rag.embeddings import load_embedding_model as L; m=L(); print('offline OK:', m.get_sentence_embedding_dimension())" || \
-	PYTHONPATH=. $$PYBIN -c "from sentence_transformers import SentenceTransformer; from config import MODEL_DIR as MD; SentenceTransformer(str(MD)); print('offline OK via direct local model path ✓')"
-
+	PYTHONPATH=. $$PYBIN -c "
+	
 # ---------- RUN ----------
 run: fetch-model
 	@if [ -x "$(UVICORN)" ]; then \

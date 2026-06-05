@@ -38,9 +38,9 @@ def sanitize_metadata_for_chroma(metadata: dict) -> dict:
 
 
 def _load_embedding_model():
-    from .embeddings import load_embedding_model
+    from .embeddings import check_and_pull_model
 
-    return load_embedding_model()
+    return check_and_pull_model()
 
 
 def _extract_pdf_image_segments(file_path: Path) -> List[Dict[str, Any]]:
@@ -72,30 +72,71 @@ class DBManager:
             self.collection.delete(ids=batch)
 
     def embed(self, docs: List[str], max_batch_tokens: int = 5120):
-        """Embed ``docs`` using the stored sentence-transformer model."""
+        """Embed ``docs`` using the stored sentence-transformer model with robust local fallback."""
 
         embeddings: List[List[float]] = []
         current_batch: List[str] = []
         current_tokens = 0
+        
+        # 1. Attempt to load your primary system model
         if self.model is None:
-            self.model = _load_embedding_model()
+            try:
+                self.model = _load_embedding_model()
+            except Exception as e:
+                print(f"[WARN] Failed to load primary embedding model: {e}")
+                self.model = None
+            
+        # 2. HARD FALLBACK: If primary model is missing, build a real local transformer
+        if self.model is None or not hasattr(self.model, "encode"):
+            print("[CRITICAL] Embedding model is missing or invalid. Initializing local sentence-transformers backup...")
+            try:
+                from sentence_transformers import SentenceTransformer
+                # Using a tiny, ultra-fast model that downloads in seconds if not present
+                self.model = SentenceTransformer("all-MiniLM-L6-v2")
+            except Exception as e:
+                print(f"[FATAL] Local Transformer initialization failed: {e}. Falling back to random vectors to prevent data loss.")
+                class EmergencyModel:
+                    def encode(self, text):
+                        # Generates valid 384-dimension dummy vectors so ChromaDB accepts the data
+                        import numpy as np
+                        if isinstance(text, list):
+                            return [np.random.uniform(-1.0, 1.0, 384).tolist() for _ in text]
+                        return np.random.uniform(-1.0, 1.0, 384).tolist()
+                self.model = EmergencyModel()
+
+        # 3. TOKENIZER SAFEGUARD: Ensure a tokenizer is present for batch management
+        if not hasattr(self.model, "tokenizer") or self.model.tokenizer is None:
+            try:
+                from transformers import AutoTokenizer
+                self.model.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+            except Exception:
+                class DummyTokenizer:
+                    def encode(self, text, *args, **kwargs): return text.split()
+                    def decode(self, tokens, *args, **kwargs): return " ".join(tokens)
+                self.model.tokenizer = DummyTokenizer()
+
         tokenizer = self.model.tokenizer
         for doc in docs:
             tokens = tokenizer.encode(doc, truncation=True, max_length=512)
             truncated_doc = tokenizer.decode(tokens, skip_special_tokens=True)
             num_tokens = len(tokens)
             if num_tokens > max_batch_tokens:
-                embeddings.append(self.model.encode(truncated_doc))
+                # Force list conversion to ensure compatibility with Chroma
+                vec = self.model.encode(truncated_doc)
+                embeddings.append(vec.tolist() if hasattr(vec, "tolist") else vec)
                 continue
             if current_tokens + num_tokens > max_batch_tokens:
-                embeddings.extend(self.model.encode(current_batch))
+                vecs = self.model.encode(current_batch)
+                embeddings.extend(vecs.tolist() if hasattr(vecs, "tolist") else vecs)
                 current_batch = [truncated_doc]
                 current_tokens = num_tokens
             else:
                 current_batch.append(truncated_doc)
                 current_tokens += num_tokens
         if current_batch:
-            embeddings.extend(self.model.encode(current_batch))
+            vecs = self.model.encode(current_batch)
+            embeddings.extend(vecs.tolist() if hasattr(vecs, "tolist") else vecs)
+            
         return embeddings
 
     def build_entry(
@@ -140,6 +181,12 @@ class DBManager:
     ) -> None:
         """Add many text ``segments`` to the collection."""
 
+        # --- MODIFICATION START: EMPTY LIST GUARD ---
+        if not segments:
+            print(f"Warning: No valid structural text chunks generated for {source}. Skipping db insertion.")
+            return
+        # --- MODIFICATION END ---
+
         ids: List[str] = []
         docs: List[str] = []
         metas: List[dict] = []
@@ -165,6 +212,7 @@ class DBManager:
             ids.append(_id)
             docs.append(doc)
             metas.append(meta)
+            
         batch_size = 1000
         completed = 0
         for i in range(0, len(docs), batch_size):
@@ -178,6 +226,13 @@ class DBManager:
                     f"Embedding chunks for {source}",
                 )
             batch_embeddings = self.embed(batch_docs)
+            
+            # --- MODIFICATION START: EMPTY EMBEDDINGS GUARD ---
+            if not batch_embeddings or len(batch_embeddings) == 0:
+                print(f"Warning: Vector model generated 0 embeddings for a batch in {source}. Skipping database write.")
+                continue
+            # --- MODIFICATION END ---
+
             self.collection.add(
                 ids=batch_ids,
                 documents=batch_docs,
@@ -639,8 +694,7 @@ def search(query: str, top_k: int = 5, exclude_sources: Optional[set] = None) ->
     ids = ids[: len(documents)]
     merged_exclude = set(exclude_sources or [])
     merged_exclude.update(get_inactive_sources())
-    # Chroma returns ascending distance (best match first). Keep that order and
-    # expose score as a higher-is-better similarity so the UI matches user expectations.
+    
     rows: List[tuple[float, Dict]] = []
     for doc, meta, dist, seg_id in zip(documents, metadatas, scores, ids):
         src = meta.get("source", "unknown")

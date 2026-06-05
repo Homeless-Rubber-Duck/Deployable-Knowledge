@@ -5,6 +5,7 @@ import contextlib
 import csv
 import io
 import re
+from .embeddings import get_text_embeddings
 
 
 def extract_pdf_images(pdf_path, output_dir=None, print_to_console=True):
@@ -100,7 +101,6 @@ def extract_pdf_images(pdf_path, output_dir=None, print_to_console=True):
 
 def safe_sent_tokenize(text: str):
     """Lightweight sentence tokenizer based on punctuation."""
-
     return re.split(r"(?<=[.!?]) +", text.strip())
 
 
@@ -112,71 +112,138 @@ def pagerank_chunk_text(
     expansion_threshold: float = 0.5,
 ):
     """Chunk text using PageRank to select representative sentences."""
-
     from sklearn.metrics.pairwise import cosine_similarity
     import networkx as nx
     import numpy as np
-    from .embeddings import load_embedding_model
+    
+    # --- MODIFICATION START: SAFELY HANDLE NONE TYPE FOR MODEL/TOKENIZER ---
+    if model is None:
+        try:
+            # Attempt to use standard HuggingFace tokenizer fallback if available
+            from transformers import AutoTokenizer
+            model = AutoTokenizer.from_pretrained("bert-base-uncased")
+        except ImportError:
+            # Create a mock tokenizer object to satisfy attribute calls like model.tokenizer
+            class DummyTokenizer:
+                def __call__(self, text, *args, **kwargs):
+                    return text.split()
+                def encode(self, text, *args, **kwargs):
+                    return text.split()
+            
+            class DummyModel:
+                def __init__(self):
+                    self.tokenizer = DummyTokenizer()
+            
+            model = DummyModel()
+    elif not hasattr(model, "tokenizer"):
+        # If model exists but framework expects a specific nested .tokenizer attribute
+        class DummyTokenizer:
+            def __call__(self, text, *args, **kwargs):
+                return text.split()
+            def encode(self, text, *args, **kwargs):
+                return text.split()
+        
+        try:
+            model.tokenizer = DummyTokenizer()
+        except AttributeError:
+            pass
+    # --- MODIFICATION END ---
 
-    sentences = safe_sent_tokenize(text)
-    model = model or load_embedding_model()
-    embeddings = model.encode(sentences, convert_to_tensor=False)
+    # 1. GUARD CLAUSE: Handle empty/whitespace text from scanned or corrupt PDFs
+    if not text or not text.strip():
+        print("Warning: Received empty text input. Skipping PageRank chunking.")
+        return []
 
+    # Tokenize sentences safely
+    raw_sentences = safe_sent_tokenize(text)
+    
+    # 2. GUARD CLAUSE: Ensure sentences actually contain text strings
+    sentences = [str(s).strip() for s in raw_sentences if s and str(s).strip()]
+    if not sentences:
+        print("Warning: No valid sentences extracted from text. Skipping.")
+        return []
+
+    # Get embeddings via your updated Ollama batch handler
+    embeddings = get_text_embeddings(sentences)
+    if not embeddings or len(embeddings) == 0:
+        return []
+
+    # Compute sentence character ranges safely
     sentence_ranges = []
     offset = 0
     for sent in sentences:
         start = text.find(sent, offset)
+        if start == -1:  # Fallback if find fails due to tokenization mismatches
+            start = offset
         end = start + len(sent)
         sentence_ranges.append((start, end))
         offset = end
 
+    # Build NetworkX graph
     G = nx.Graph()
     sim_matrix = cosine_similarity(embeddings)
+    
     for i in range(len(sentences)):
         G.add_node(i)
+        
     for i in range(len(sentences)):
         for j in range(i + 1, len(sentences)):
-            sim = sim_matrix[i][j]
+            sim = float(sim_matrix[i][j])  # Cast numpy float to standard float
             if sim > sim_threshold:
                 G.add_edge(i, j, weight=sim)
 
-    pageranks = nx.pagerank(G, weight="weight")
+    # 3. GUARD CLAUSE: If graph has no edges, PageRank fails. Handle gracefully.
+    if G.number_of_edges() == 0:
+        # Fallback: Treat each sentence as its own chunk or return the text linearly
+        print("Warning: Low text similarity graph density. Falling back to linear assignment.")
+        pageranks = {i: 1.0 / len(sentences) for i in range(len(sentences))}
+    else:
+        try:
+            pageranks = nx.pagerank(G, weight="weight")
+        except Exception as e:
+            print(f"PageRank convergence failed: {e}. Falling back to default scoring.")
+            pageranks = {i: 1.0 / len(sentences) for i in range(len(sentences))}
+
+    # Select top ranking seeds
     seed_indices = sorted(pageranks, key=pageranks.get, reverse=True)[:top_k]
 
     used = set()
     chunks = []
     chunk_idx = 0
+    
     for idx in seed_indices:
         if idx in used:
             continue
         chunk = [idx]
         used.add(idx)
 
+        # Backward expansion (OPTIMIZED: Uses precalculated sim_matrix instead of API re-calls)
         i = idx - 1
         while (
             i >= 0
             and i not in used
-            and cosine_similarity([embeddings[i]], [embeddings[chunk[0]]])[0][0]
-            > expansion_threshold
+            and sim_matrix[i][chunk[0]] > expansion_threshold
         ):
             chunk.insert(0, i)
             used.add(i)
             i -= 1
 
+        # Forward expansion (OPTIMIZED: Uses precalculated sim_matrix)
         i = idx + 1
         while (
             i < len(sentences)
             and i not in used
-            and cosine_similarity([embeddings[i]], [embeddings[chunk[-1]]])[0][0]
-            > expansion_threshold
+            and sim_matrix[i][chunk[-1]] > expansion_threshold
         ):
             chunk.append(i)
             used.add(i)
             i += 1
 
-        chunk_text = " ".join(sentences[i] for i in chunk)
+        # Reconstruct texts and metrics
+        chunk_text = " ".join(sentences[sent_idx] for sent_idx in chunk)
         start_char = sentence_ranges[chunk[0]][0]
         end_char = sentence_ranges[chunk[-1]][1]
+        
         chunks.append(
             (
                 chunk_text,
@@ -220,7 +287,6 @@ def remove_frequent_lines(pages, threshold=0.9):
 
 def serialize_table_rows(rows):
     """Serialize PyMuPDF table rows to CSV text."""
-
     if not rows:
         return ""
 
@@ -344,7 +410,6 @@ def parse_pdf(pdf_path, margin_top=50, margin_bottom=50, margin_left=50, margin_
 
     Returns:
         List[Dict]: List of dictionaries with page number and cleaned text content.
-        Each dictionary has keys "page" and "text".
     """
     pdf_path = Path(pdf_path)
     assert pdf_path.exists(), f"File does not exist: {pdf_path}"
@@ -366,12 +431,11 @@ def parse_pdf(pdf_path, margin_top=50, margin_bottom=50, margin_left=50, margin_
             margin_right,
         )
 
-    all_cleaned_text = remove_frequent_lines(all_cleaned_text)  # update this function if needed
+    all_cleaned_text = remove_frequent_lines(all_cleaned_text)
 
     return all_cleaned_text
 
 
-# Replace input_pdf and output_txt with desired file paths
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Extract clean text from a PDF, removing headers and footers."

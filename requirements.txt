@@ -17,3 +17,4 @@ watchfiles==1.2.0
 rapidocr==3.8.1
 pymupdf==1.27.2
 pillow==11.0.0
+ollama
